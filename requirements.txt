@@ -1,0 +1,4 @@
+telethon==1.33.1
+supabase==2.3.4
+python-dotenv==1.0.1
+asyncio==3.4.3

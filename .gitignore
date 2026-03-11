@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+.Python
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime/session data
+sessions/
+*.session
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
