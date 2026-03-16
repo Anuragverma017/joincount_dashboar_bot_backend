@@ -22,9 +22,7 @@ env/
 # Runtime/session data
 sessions/
 *.session
+*.log
 
-# Editor/OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+# Media
+broadcast_media/
