@@ -2,16 +2,32 @@ import os
 import asyncio
 import logging
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import create_async_client, AsyncClient
 from telethon import TelegramClient, events, Button
-from concurrent.futures import ThreadPoolExecutor
 
 # ---- Logging Setup ----
+# Get script directory for absolute logging path
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+# Set root level to WARNING to avoid noise from libraries
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.WARNING,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(LOG_DIR, "broadcast_bot.log"))
+    ]
 )
 logger = logging.getLogger("BroadcastBot")
+logger.setLevel(logging.INFO)
+
+# Silence specific libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telethon").setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -22,43 +38,52 @@ API_HASH = os.environ.get("TELEGRAM_API_HASH", "dummyhash")
 BOT_TOKEN = os.environ.get("BROADCAST_BOT_TOKEN")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Supabase URL and Key must be defined")
+    raise ValueError("Supabase URL and Key must be defined in environment variables")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Initialize globally as None, then await in main()
+supabase: AsyncClient = None
 
-async def run_supabase_query(query):
-    return await asyncio.to_thread(query.execute)
+# ---- Supabase Optimization Removed ----
+# AsyncClient handles concurrency natively.
 
 # {user_id: {'step': 'selecting_channel', 'channel_id': '...', 'channel_name': '...', 'message_data': {...}}}
 user_states = {}
 
 async def get_owner_data(tg_user_id):
+    if not supabase: return None
     # Try profiles first
-    query = supabase.table('profiles').select('id').eq('telegram_user_id', tg_user_id)
-    res = await run_supabase_query(query)
-    if res.data:
-        return res.data[0]
+    res = await supabase.table('profiles').select('id').eq('telegram_user_id', tg_user_id).execute()
+    data = getattr(res, 'data', [])
+    if data:
+        return data[0]
     
     # Try subscriptions as fallback
-    query = supabase.table('app_user_subscriptions').select('user_id').eq('telegram_user_id', tg_user_id)
-    res = await run_supabase_query(query)
-    if res.data:
-        return {'id': res.data[0]['user_id']}
+    res = await supabase.table('app_user_subscriptions').select('user_id').eq('telegram_user_id', tg_user_id).execute()
+    data = getattr(res, 'data', [])
+    if data:
+        return {'id': data[0]['user_id']}
         
     return None
 
 async def get_owner_channels(user_id):
-    bots_res = await run_supabase_query(supabase.table('telegram_tracker').select('id').eq('user_id', user_id))
-    if not bots_res or not bots_res.data:
+    if not supabase: return []
+    bots_res = await supabase.table('telegram_tracker').select('id').eq('user_id', user_id).execute()
+    bots_data = getattr(bots_res, 'data', [])
+    if not bots_data:
         return []
-    bot_ids = [b['id'] for b in bots_res.data]
-    mappings_res = await run_supabase_query(supabase.table('bot_channel_mappings').select('channel_id, channel_name').in_('bot_id', bot_ids).eq('status', 'Active'))
-    return mappings_res.data if mappings_res and mappings_res.data else []
+    bot_ids = [b['id'] for b in bots_data]
+    mappings_res = await supabase.table('bot_channel_mappings').select('channel_id, channel_name').in_('bot_id', bot_ids).eq('status', 'Active').execute()
+    mappings_data = getattr(mappings_res, 'data', [])
+    return mappings_data
 
 async def main():
+    global supabase
     if not BOT_TOKEN:
         logger.error("BROADCAST_BOT_TOKEN not found in .env")
         return
+    
+    # Initialize the Async client
+    supabase = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
 
     # Ensure sessions directory exists relative to the script
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -73,172 +98,144 @@ async def main():
     logger.info("Broadcast Master Bot (@Gapgrowbot) started!")
 
     @client.on(events.NewMessage)
-    async def debug_log_handler(event):
-        logger.info(f"Incoming message from {event.sender_id}: {event.text}")
+    async def global_message_handler(event):
+        sender_id = event.sender_id
+        if not event.is_private:
+            return
 
-    @client.on(events.NewMessage(pattern=r'^/start(?: (.*))?'))
-    async def start_handler(event):
-        payload = event.pattern_match.group(1)
-        sender = await event.get_sender()
-        logger.info(f"Handling /start for {sender.id} with payload: {payload}")
+        text = event.text or ""
+        
+        # 1. Handle commands always
+        if text.startswith('/start'):
+            payload = None
+            if ' ' in text:
+                payload = text.split(' ', 1)[1]
+            
+            sender = await event.get_sender()
+            logger.info(f"Handling /start for {sender.id} with payload: {payload}")
 
-        if payload and payload.lower() != "true":
-            logger.info(f"Attempting to link account for UUID: {payload} with TG ID: {sender.id}")
-            try:
-                # Update profiles
-                p_res = await run_supabase_query(
-                    supabase.table('profiles')
-                    .update({'telegram_user_id': sender.id})
-                    .eq('id', payload)
-                )
-                logger.info(f"Profile update result: {p_res.data if p_res else 'None'}")
-                
-                # Update subscriptions
-                s_res = await run_supabase_query(
-                    supabase.table('app_user_subscriptions')
-                    .update({'telegram_user_id': sender.id})
-                    .eq('user_id', payload)
-                )
-                logger.info(f"Subscription update result: {s_res.data if s_res else 'None'}")
-                
-                await event.respond(
-                    "✅ **Telegram Account Connected Successfully!**\n\n"
-                    "Your account is now linked to the GAP dashboard. You can return to the dashboard to start broadcasting."
-                )
-                return
-            except Exception as e:
-                logger.error(f"DETAILED ERROR linking account for payload {payload}: {e}", exc_info=True)
-                await event.respond(f"❌ Failed to link account: {str(e)}")
+            if payload and payload.lower() != "true":
+                logger.info(f"Attempting to link account for UUID: {payload} with TG ID: {sender.id}")
+                try:
+                    await supabase.table('profiles').update({'telegram_user_id': sender.id}).eq('id', payload).execute()
+                    await supabase.table('app_user_subscriptions').update({'telegram_user_id': sender.id}).eq('user_id', payload).execute()
+                    await event.respond("✅ **Telegram Account Connected Successfully!**")
+                    return
+                except Exception as e:
+                    logger.error(f"Error linking account: {e}")
+                    await event.respond(f"❌ Failed to link account: {str(e)}")
+                    return
+
+            owner = await get_owner_data(sender.id)
+            if not owner:
+                await event.respond("🚀 **Welcome!** Please connect your account in the dashboard first.")
                 return
 
-        owner = await get_owner_data(sender.id)
-        logger.info(f"Owner data for {sender.id}: {owner}")
-        if not owner:
             await event.respond(
                 "🚀 **Welcome to GAP Grow Broadcast Bot**\n\n"
-                "To start broadcasting, please connect your Telegram account in the dashboard first.\n\n"
-                "If you just clicked the 'Start Setup' button, please try again."
+                "Use /send to start building your broadcast."
             )
             return
 
-        msg = (
-            "🚀 **Welcome to GAP Grow Broadcast Bot**\n\n"
-            "Use this bot to send messages to all users who joined your channels through our tracking bots.\n\n"
-            "**Instructions:**\n"
-            "1️⃣ Use `/send` to start building your broadcast.\n"
-            "2️⃣ Select the target channel from your connected list.\n"
-            "3️⃣ Send the message you want to broadcast.\n"
-            "4️⃣ Verify and confirm the broadcast.\n\n"
-            "Type `/send` to begin!"
-        )
-        await event.respond(msg)
+        if text.startswith('/send'):
+            sender = await event.get_sender()
+            owner_data = await get_owner_data(sender.id)
+            if not owner_data:
+                await event.respond("Owner verification failed.")
+                return
 
-    @client.on(events.NewMessage(pattern='/send'))
-    async def send_handler(event):
-        sender = await event.get_sender()
-        owner = await get_owner_data(sender.id)
-        if not owner:
-            await event.respond("Owner verification failed. Please check your dashboard.")
+            channels = await get_owner_channels(owner_data.get('id'))
+            if not channels:
+                await event.respond("No active channels found.")
+                return
+
+            buttons = []
+            seen_ids = set()
+            for ch in channels:
+                cid = ch.get('channel_id')
+                if cid and cid not in seen_ids:
+                    buttons.append([Button.inline(ch.get('channel_name') or "Unnamed", data=f"selchan_{cid}")])
+                    seen_ids.add(cid)
+
+            user_states[sender.id] = {'step': 'selecting_channel'}
+            await event.respond("Select the target channel audience:", buttons=buttons)
             return
 
-        channels = await get_owner_channels(owner['id'])
-        if not channels:
-            await event.respond("No active channels found. Connect a bot to a channel first.")
+        # 2. Handle state-based messages
+        state = user_states.get(sender_id)
+        if not state:
             return
 
-        seen_ids = set()
-        buttons = []
-        for ch in channels:
-            cid = ch['channel_id']
-            if cid not in seen_ids:
-                buttons.append([Button.inline(ch['channel_name'] or "Unnamed", data=f"selchan_{cid}")])
-                seen_ids.add(cid)
+        if state.get('step') == 'awaiting_message':
+            media_path = None
+            if event.media:
+                media_dir = os.path.join(os.path.dirname(__file__), "broadcast_media")
+                os.makedirs(media_dir, exist_ok=True)
+                media_path = await event.download_media(file=os.path.join(media_dir, f"tmp_{event.id}"))
+                logger.info(f"Downloaded media: {media_path}")
 
-        user_states[sender.id] = {'step': 'selecting_channel'}
-        await event.respond("Select the target channel audience:", buttons=buttons)
+            state.update({
+                'step': 'verifying',
+                'original_msg': event.message,
+                'media_path': media_path,
+                'message_data': {
+                    'text': event.text,
+                    'media': event.media is not None,
+                    'raw_text': event.message.message
+                }
+            })
+            
+            await event.respond("📝 **Preview of your broadcast message:**")
+            preview_msg = await event.message.reply(
+                f"Broadcast to audience of **{state['channel_name']}**?",
+                buttons=[
+                    [Button.inline("✅ Send Broadcast", data="confirm_send")],
+                    [Button.inline("❌ Cancel", data="cancel_broadcast")]
+                ]
+            )
+            state['preview_msg_id'] = preview_msg.id
 
     @client.on(events.CallbackQuery(data=lambda d: d.decode().startswith('selchan_')))
     async def channel_selection_handler(event):
         channel_id = event.data.decode().split('_')[1]
         sender_id = event.sender_id
         
-        res = await run_supabase_query(supabase.table('bot_channel_mappings').select('channel_name').eq('channel_id', channel_id).limit(1))
-        channel_name = res.data[0]['channel_name'] if res and res.data else "Unknown"
-
-        user_states[sender_id] = {
-            'step': 'awaiting_message',
-            'channel_id': channel_id,
-            'channel_name': channel_name
-        }
-
-        await event.edit(f"✅ **{channel_name}** selected.\n\nNow, send the message (text/media) you want to broadcast.", buttons=[Button.inline("❌ Cancel", data="cancel_broadcast")])
-
-    @client.on(events.NewMessage)
-    async def message_input_handler(event):
-        sender_id = event.sender_id
-        state = user_states.get(sender_id)
-        if not state or state.get('step') != 'awaiting_message' or (event.text and event.text.startswith('/')):
-            return
-
-        media_path = None
-        if event.media:
-            # Create a unique filename for this media
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            media_dir = os.path.join(base_dir, "broadcast_media")
-            if not os.path.exists(media_dir):
-                os.makedirs(media_dir)
-            
-            # Use event.id for a temporary unique name
-            media_path = await event.download_media(file=os.path.join(media_dir, f"tmp_{event.id}"))
-            logger.info(f"Downloaded media to {media_path}")
-
-        state.update({
-            'step': 'verifying',
-            'original_msg': event.message,
-            'media_path': media_path,
-            'message_data': {
-                'text': event.text, 
-                'media': event.media is not None,
-                'raw_text': event.message.message
-            }
-        })
-        
-        await event.respond("📝 **Preview of your broadcast message:**")
-        preview_msg = await event.message.reply(
-            f"Broadcast to audience of **{state['channel_name']}**?",
-            buttons=[
-                [Button.inline("✅ Send Broadcast", data="confirm_send")],
-                [Button.inline("❌ Cancel", data="cancel_broadcast")]
-            ]
-        )
-        state['preview_msg_id'] = preview_msg.id
+        try:
+            res = await supabase.table('bot_channel_mappings').select('channel_name').eq('channel_id', channel_id).limit(1).execute()
+            channel_name = res.data[0]['channel_name'] if res.data else "Unknown"
+            user_states[sender_id] = {'step': 'awaiting_message', 'channel_id': channel_id, 'channel_name': channel_name}
+            await event.edit(f"✅ **{channel_name}** selected. Send your message now.")
+        except Exception as e:
+            logger.error(f"Selection error: {e}")
+            await event.answer("Error selecting channel.")
 
     @client.on(events.CallbackQuery(data='confirm_send'))
     async def confirm_handler(event):
         sender_id = event.sender_id
         state = user_states.get(sender_id)
         if not state or state.get('step') != 'verifying':
-            await event.answer("Session expired. Start again with /send.")
+            await event.answer("Session expired or invalid state.")
             return
 
-        owner = await get_owner_data(sender_id)
-        task_data = {
-            'user_id': owner['id'],
-            'channel_id': state['channel_id'],
-            'message_data': {
-                'text': state['original_msg'].text,
-                'has_media': state['original_msg'].media is not None,
-                'raw_text': state['original_msg'].message,
-                'media_path': state.get('media_path')
-            },
-            'status': 'pending'
-        }
-        
-        res = await run_supabase_query(supabase.table('broadcast_tasks').insert(task_data))
-        if res and res.data:
-            await event.edit(f"🚀 **Broadcast started!** Task ID: {res.data[0]['id'][:8]}...")
+        try:
+            owner_data = await get_owner_data(sender_id)
+            orig_msg = state.get('original_msg')
+            task_data = {
+                'user_id': owner_data.get('id'),
+                'channel_id': state.get('channel_id'),
+                'message_data': {
+                    'text': orig_msg.text if orig_msg else "",
+                    'has_media': bool(orig_msg.media) if orig_msg else False,
+                    'raw_text': orig_msg.message if orig_msg else "",
+                    'media_path': state.get('media_path')
+                },
+                'status': 'pending'
+            }
+            await supabase.table('broadcast_tasks').insert(task_data).execute()
+            await event.edit("✅ **Broadcast task created!**")
             user_states.pop(sender_id, None)
-        else:
+        except Exception as e:
+            logger.error(f"Confirm error: {e}")
             await event.edit("❌ Failed to create task.")
 
     @client.on(events.CallbackQuery(data='cancel_broadcast'))
