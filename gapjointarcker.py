@@ -1,3 +1,7 @@
+# this bot file is totaly working for gap joining bot
+# this is old FILE THAT IS NOT UPDATED AND IT IS MISSING THE BOT START STATUS ON THE DESHBOARD , AND ALSO NO INCLUDE REMINDER SENDING FUNCTIONALITY. in case if i update the code and got problem then i will use this file to revert back.
+
+
 import os
 import asyncio
 import datetime
@@ -9,7 +13,6 @@ from telethon import TelegramClient, events
 from telethon.tl.functions.messages import ExportChatInviteRequest
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.errors import UserNotParticipantError
-from telethon.tl.types import UpdateBotChatInviteRequester
 from telethon.tl.custom import Button
 import aiohttp
 
@@ -187,8 +190,6 @@ async def start_bot(token: str, bot_id: str):
                     try:
                         # Check for existing record to preserve history
                         existing_res = await supabase.table('bot_join_users').select('*').eq('link_id', link_id).eq('telegram_user_id', str(user_id)).execute()
-                        existing_data = getattr(existing_res, 'data', []) or []
-                        current_status = existing_data[0].get('status') if existing_data else None
                         
                         upsert_data = {
                             "user_id": admin_id,
@@ -197,27 +198,21 @@ async def start_bot(token: str, bot_id: str):
                             "telegram_user_id": str(user_id),
                             "telegram_username": getattr(sender, 'username', None),
                             "telegram_first_name": getattr(sender, 'first_name', None),
-                            "joined_channel": already_joined,
-                            # Reset last_reminded_at so reminder cycle restarts on re-start
-                            "last_reminded_at": None,
+                            "joined_channel": already_joined
                         }
                         
                         if already_joined:
-                            # User is already in channel → Active
-                            upsert_data["status"] = "active"
-                            upsert_data["left_channel"] = False
-                            # Only set joined_at if not already recorded
-                            if not existing_data or not existing_data[0].get('joined_at'):
+                            # Only set joined_at if not already set or if rejoining
+                            data = getattr(existing_res, 'data', [])
+                            if not data or not data[0].get('joined_at'):
                                 upsert_data["joined_at"] = datetime.datetime.utcnow().isoformat()
-                        else:
-                            # Only go back to 'bot_started' if user hasn't progressed to pending/active/leaved
-                            # (i.e., don't downgrade status if they already sent a request)
-                            if current_status not in ('pending', 'active', 'leaved'):
-                                upsert_data["status"] = "bot_started"
+                            
+                            # If they are already in the channel, they are NOT "currently left"
+                            upsert_data["left_channel"] = False
                             
                         # Perform upsert
                         await supabase.table('bot_join_users').upsert(upsert_data, on_conflict="link_id,telegram_user_id").execute()
-                        logger.info(f"Bot {bot_id}: upserted user {user_id}. Status → {'active' if already_joined else current_status or 'bot_started'}")
+                        logger.info(f"Bot {bot_id}: upserted user {user_id} record. Already joined: {already_joined}")
                     except Exception as log_err:
                         logger.error(f"Failed to log bot start: {log_err}")
 
@@ -280,27 +275,13 @@ async def start_bot(token: str, bot_id: str):
                     
                     try:
                         now_iso = datetime.datetime.utcnow().isoformat()
-
-                        # Check previous status to detect if this is a REJOIN
-                        prev_res = await supabase.table('bot_join_users').select('status, rejoin_count').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
-                        prev_data = getattr(prev_res, 'data', []) or []
-
-                        update_data = {
+                        # Update ALL records for this user and bot to mark them as Active
+                        await supabase.table('bot_join_users').update({
                             "joined_channel": True,
                             "left_channel": False,
-                            "joined_at": now_iso,
-                            "status": "active",
-                            "last_reminded_at": None,  # Reset reminder cycle
-                        }
-
-                        if prev_data and prev_data[0].get('status') == 'leaved':
-                            # User was leaved and just came back — it's a REJOIN
-                            update_data["rejoined_at"] = now_iso
-                            logger.info(f"Bot {bot_id}: User {user_tg_id} REJOINED the channel.")
-                        else:
-                            logger.info(f"Bot {bot_id}: Updated record for user {user_tg_id} as ACTIVE.")
-
-                        await supabase.table('bot_join_users').update(update_data).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
+                            "joined_at": now_iso
+                        }).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
+                        logger.info(f"Bot {bot_id}: Updated record for user {user_tg_id} as ACTIVE.")
                     except Exception as log_err:
                         logger.error(f"Failed to update channel join stats: {log_err}")
 
@@ -313,37 +294,16 @@ async def start_bot(token: str, bot_id: str):
                     try:
                         now_iso = datetime.datetime.utcnow().isoformat()
                         # Update ALL records to mark them as Leaved
-                        # Clear rejoined_at — user left again so rejoin state is no longer active
-                        # (rejoin_count is kept as historical record for dashboard)
                         await supabase.table('bot_join_users').update({
                             "left_channel": True,
-                            "left_at": now_iso,
-                            "joined_channel": False,
-                            "status": "leaved",
-                            "rejoined_at": None,  # Clear — they've left again
-                            "last_reminded_at": None,  # Reset so 12h reminder restarts from left_at
+                            "left_at": now_iso
                         }).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
-                        logger.info(f"Bot {bot_id}: Updated record for user {user_tg_id} as LEAVED. rejoined_at cleared.")
+                        logger.info(f"Bot {bot_id}: Updated record for user {user_tg_id} as LEFT.")
                     except Exception as log_err:
                         logger.error(f"Failed to update channel leave stats: {log_err}")
                         
             except Exception as ev_err:
                 logger.error(f"Error in chat handler: {ev_err}")
-
-        # ---- Handle Join Requests (user clicked Request-to-Join link) ----
-        # Fires when a user sends a membership request via a request_needed=True invite link
-        @client.on(events.Raw(UpdateBotChatInviteRequester))
-        async def join_request_handler(event):
-            try:
-                user_tg_id = str(event.user_id)
-                logger.info(f"Bot {bot_id}: JOIN REQUEST received from user {user_tg_id}")
-                # Status: user has sent the request but hasn't been approved/joined yet → pending
-                await supabase.table('bot_join_users').update({
-                    "status": "pending",
-                }).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
-                logger.info(f"Bot {bot_id}: Set status=pending for user {user_tg_id} (join request received).")
-            except Exception as jr_err:
-                logger.error(f"Bot {bot_id}: Error handling join request: {jr_err}")
 
         # Handle channel messages to link channels
         @client.on(events.NewMessage)
@@ -410,132 +370,7 @@ async def start_bot(token: str, bot_id: str):
 
         active_clients[bot_id] = client
         active_semaphores[bot_id] = asyncio.Semaphore(10)
-
-        # ---- 6. Background: 12-hour interval reminders for bot_started and leaved users ----
-        async def resend_reminders():
-            """
-            Runs every 30 minutes. Sends reminders to:
-              - 'bot_started' users who haven't sent a join request (after 12h, then every 12h)
-              - 'leaved' users who left the channel (after 12h from left_at, then every 12h)
-            Uses 'last_reminded_at' timestamp to track intervals — safe, no spam.
-            """
-            await asyncio.sleep(300)  # Wait 5 min after bot start before first check
-            while True:
-                try:
-                    now = datetime.datetime.utcnow()
-                    cutoff_12h = (now - datetime.timedelta(hours=12)).isoformat()
-
-                    # Fetch all candidates: status is bot_started or leaved
-                    remind_res = await supabase.table('bot_join_users')\
-                        .select('*, link:bot_join_links(*)')\
-                        .eq('bot_id', bot_id)\
-                        .in_('status', ['bot_started', 'leaved'])\
-                        .execute()
-                    all_candidates = getattr(remind_res, 'data', []) or []
-
-                    # Filter in Python: only remind if 12h have passed since last reminder
-                    # (or since created_at / left_at if never reminded)
-                    users_to_remind = []
-                    for u in all_candidates:
-                        last_reminded = u.get('last_reminded_at')
-                        if last_reminded:
-                            # Already reminded before — remind again only after 12h
-                            if last_reminded < cutoff_12h:
-                                users_to_remind.append(u)
-                        else:
-                            # Never reminded — use created_at for bot_started, left_at for leaved
-                            user_status = u.get('status')
-                            baseline = (
-                                u.get('left_at') or u.get('created_at')
-                                if user_status == 'leaved'
-                                else u.get('created_at')
-                            )
-                            if baseline and baseline < cutoff_12h:
-                                users_to_remind.append(u)
-
-                    if users_to_remind:
-                        logger.info(f"Bot {bot_id}: 12h reminder — {len(users_to_remind)} users to notify.")
-
-                    for user_record in users_to_remind:
-                        try:
-                            user_tg_id = int(user_record['telegram_user_id'])
-                            link_config = user_record.get('link')
-                            user_status = user_record.get('status')
-                            if not link_config:
-                                continue
-
-                            # Fetch the invite link from the original channel mapping
-                            invite_link_str = "https://t.me/"
-                            if link_config.get('channel_mapping_id'):
-                                m_res = await supabase.table('bot_channel_mappings')\
-                                    .select('invite_link')\
-                                    .eq('id', link_config['channel_mapping_id'])\
-                                    .execute()
-                                if m_res.data and m_res.data[0].get('invite_link'):
-                                    invite_link_str = m_res.data[0]['invite_link']
-
-                            keyboard = [[Button.url(
-                                link_config.get('button_text') or "Join Channel",
-                                invite_link_str
-                            )]]
-
-                            # Pick the right message based on status
-                            if user_status == 'leaved':
-                                reminder_text = (
-                                    "👋 *We miss you!*\n\n"
-                                    "It looks like you left the channel. "
-                                    "Come back and rejoin anytime using the link below!"
-                                )
-                            else:  # bot_started
-                                reminder_text = (
-                                    "🔔 *Reminder!*\n\n"
-                                    "You haven't joined the channel yet. "
-                                    "Click the button below to join now!"
-                                )
-
-                            # Append the admin's custom message if available
-                            custom_msg = link_config.get('telegram_message') or ""
-                            if custom_msg:
-                                reminder_text = f"{reminder_text}\n\n{custom_msg}"
-
-                            if link_config.get('telegram_image_url'):
-                                await client.send_message(
-                                    user_tg_id, reminder_text,
-                                    file=link_config.get('telegram_image_url'),
-                                    buttons=keyboard
-                                )
-                            else:
-                                await client.send_message(
-                                    user_tg_id, reminder_text, buttons=keyboard
-                                )
-
-                            # Update last_reminded_at so next reminder is 12h from now
-                            await supabase.table('bot_join_users')\
-                                .update({'last_reminded_at': now.isoformat(), 'reminder_sent': True})\
-                                .eq('id', user_record['id'])\
-                                .execute()
-
-                            logger.info(
-                                f"Bot {bot_id}: Reminder sent to user {user_tg_id} "
-                                f"(status: {user_status}). Next in 12h."
-                            )
-                            await asyncio.sleep(0.5)  # Rate limiting between individual sends
-
-                        except Exception as remind_user_err:
-                            logger.error(
-                                f"Bot {bot_id}: Failed to remind user "
-                                f"{user_record.get('telegram_user_id')}: {remind_user_err}"
-                            )
-
-                except Exception as remind_loop_err:
-                    logger.error(f"Bot {bot_id}: Error in resend_reminders loop: {remind_loop_err}")
-
-                # Check every 30 min — only acts when 12h have actually passed
-                await asyncio.sleep(1800)
-
-        asyncio.create_task(resend_reminders())
-        logger.info(f"Bot {bot_id}: 12h reminder task started (checks every 30 min).")
-
+        
         # ---- 5. Missing state transition handling fixed ----
         # The bot will run continuously without the 5-minute timeout.
         # Since the bot_runner polls Supabase every 15 seconds, your bot instantly starts
