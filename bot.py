@@ -16,10 +16,7 @@ import aiohttp
 # ---- 1. Logging Setup ----
 # Get script directory for absolute logging path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
+LOG_FILE = os.path.join(BASE_DIR, "bot.log")
 
 # Set root level to WARNING to silence noisy libraries like httpx and telethon
 logging.basicConfig(
@@ -27,7 +24,7 @@ logging.basicConfig(
     level=logging.WARNING,
     handlers=[
         logging.StreamHandler(), # Console
-        logging.FileHandler(os.path.join(LOG_DIR, "bot.log"), encoding='utf-8') # File
+        logging.FileHandler(LOG_FILE, encoding='utf-8') # File
     ]
 )
 # Manually set our bot's logger to INFO
@@ -58,6 +55,9 @@ running_tasks = {}
 # Dictionary to cache the bot configurations from the database (reduces DB calls drastically)
 GLOBAL_BOT_CONFIGS = {} 
 # Dictionary to store channel mappings for each bot
+GLOBAL_CHANNEL_MAPPINGS = {}
+# Dictionary to cache when a channel was last detected to avoid spam (bot_id_channel_id -> datetime)
+CHANNEL_LAST_DETECTED = {}
 GLOBAL_CHANNEL_MAPPINGS = {} 
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "12345678"))
@@ -279,9 +279,9 @@ async def start_bot(token: str, bot_id: str):
                     logger.info(f"Bot {bot_id}: DETECTED JOIN - User {user_tg_id} in Chat {chat_id}")
                     
                     try:
-                        now_iso = datetime.datetime.utcnow().isoformat()
+                        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-                        # Check previous status to detect if this is a REJOIN
+                        # Check previous status + rejoin_count to detect REJOIN
                         prev_res = await supabase.table('bot_join_users').select('status, rejoin_count').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
                         prev_data = getattr(prev_res, 'data', []) or []
 
@@ -291,12 +291,14 @@ async def start_bot(token: str, bot_id: str):
                             "joined_at": now_iso,
                             "status": "active",
                             "last_reminded_at": None,  # Reset reminder cycle
+                            "is_bot_blocked": False,    # Clear blocked flag if they interact again
                         }
 
                         if prev_data and prev_data[0].get('status') == 'leaved':
                             # User was leaved and just came back — it's a REJOIN
                             update_data["rejoined_at"] = now_iso
-                            logger.info(f"Bot {bot_id}: User {user_tg_id} REJOINED the channel.")
+                            update_data["rejoin_count"] = (prev_data[0].get('rejoin_count') or 0) + 1
+                            logger.info(f"Bot {bot_id}: User {user_tg_id} REJOINED the channel. rejoin_count={update_data['rejoin_count']}")
                         else:
                             logger.info(f"Bot {bot_id}: Updated record for user {user_tg_id} as ACTIVE.")
 
@@ -311,10 +313,9 @@ async def start_bot(token: str, bot_id: str):
                     logger.info(f"Bot {bot_id}: DETECTED LEAVE - User {user_tg_id} from Chat {chat_id}")
                     
                     try:
-                        now_iso = datetime.datetime.utcnow().isoformat()
+                        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
                         # Update ALL records to mark them as Leaved
                         # Clear rejoined_at — user left again so rejoin state is no longer active
-                        # (rejoin_count is kept as historical record for dashboard)
                         await supabase.table('bot_join_users').update({
                             "left_channel": True,
                             "left_at": now_iso,
@@ -356,6 +357,16 @@ async def start_bot(token: str, bot_id: str):
                 chat = await event.get_chat()
                 full_channel_id = chat.id
                 
+                # Check cache to avoid spamming the DB and logs on EVERY message
+                cache_key = f"{bot_id}_{full_channel_id}"
+                now = datetime.datetime.now(datetime.timezone.utc)
+                if cache_key in CHANNEL_LAST_DETECTED:
+                    last_detected = CHANNEL_LAST_DETECTED[cache_key]
+                    if (now - last_detected).total_seconds() < 86400:  # 24 hours = 86400 seconds
+                        return  # Skip processing if we already updated it within the last 24h
+                
+                CHANNEL_LAST_DETECTED[cache_key] = now
+
                 try:
                     channel_name = getattr(chat, 'title', f"Channel {full_channel_id}")
                     channel_username = getattr(chat, 'username', None)
@@ -422,14 +433,16 @@ async def start_bot(token: str, bot_id: str):
             await asyncio.sleep(300)  # Wait 5 min after bot start before first check
             while True:
                 try:
-                    now = datetime.datetime.utcnow()
+                    now = datetime.datetime.now(datetime.timezone.utc)
                     cutoff_12h = (now - datetime.timedelta(hours=12)).isoformat()
 
                     # Fetch all candidates: status is bot_started or leaved
+                    # Skip users who have blocked the bot (is_bot_blocked = true)
                     remind_res = await supabase.table('bot_join_users')\
                         .select('*, link:bot_join_links(*)')\
                         .eq('bot_id', bot_id)\
                         .in_('status', ['bot_started', 'leaved'])\
+                        .eq('is_bot_blocked', False)\
                         .execute()
                     all_candidates = getattr(remind_res, 'data', []) or []
 
@@ -498,27 +511,47 @@ async def start_bot(token: str, bot_id: str):
                             if custom_msg:
                                 reminder_text = f"{reminder_text}\n\n{custom_msg}"
 
-                            if link_config.get('telegram_image_url'):
-                                await client.send_message(
-                                    user_tg_id, reminder_text,
-                                    file=link_config.get('telegram_image_url'),
-                                    buttons=keyboard
-                                )
-                            else:
-                                await client.send_message(
-                                    user_tg_id, reminder_text, buttons=keyboard
+                            try:
+                                if link_config.get('telegram_image_url'):
+                                    await client.send_message(
+                                        user_tg_id, reminder_text,
+                                        file=link_config.get('telegram_image_url'),
+                                        buttons=keyboard
+                                    )
+                                else:
+                                    await client.send_message(
+                                        user_tg_id, reminder_text, buttons=keyboard
+                                    )
+
+                                # Update last_reminded_at so next reminder is 12h from now
+                                await supabase.table('bot_join_users')\
+                                    .update({'last_reminded_at': now.isoformat(), 'reminder_sent': True})\
+                                    .eq('id', user_record['id'])\
+                                    .execute()
+
+                                logger.info(
+                                    f"Bot {bot_id}: Reminder sent to user {user_tg_id} "
+                                    f"(status: {user_status}). Next in 12h."
                                 )
 
-                            # Update last_reminded_at so next reminder is 12h from now
-                            await supabase.table('bot_join_users')\
-                                .update({'last_reminded_at': now.isoformat(), 'reminder_sent': True})\
-                                .eq('id', user_record['id'])\
-                                .execute()
+                            except Exception as send_err:
+                                err_str = str(send_err).lower()
+                                if 'blocked' in err_str or 'user is blocked' in err_str or 'forbidden' in err_str:
+                                    # User has blocked the bot — set is_bot_blocked=True to skip forever
+                                    logger.warning(
+                                        f"Bot {bot_id}: User {user_tg_id} has BLOCKED the bot. "
+                                        f"Setting is_bot_blocked=True to skip future reminders."
+                                    )
+                                    await supabase.table('bot_join_users')\
+                                        .update({'is_bot_blocked': True})\
+                                        .eq('id', user_record['id'])\
+                                        .execute()
+                                else:
+                                    logger.error(
+                                        f"Bot {bot_id}: Failed to send reminder to user "
+                                        f"{user_tg_id}: {send_err}"
+                                    )
 
-                            logger.info(
-                                f"Bot {bot_id}: Reminder sent to user {user_tg_id} "
-                                f"(status: {user_status}). Next in 12h."
-                            )
                             await asyncio.sleep(0.5)  # Rate limiting between individual sends
 
                         except Exception as remind_user_err:
