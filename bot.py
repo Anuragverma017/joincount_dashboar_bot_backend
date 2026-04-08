@@ -12,7 +12,7 @@ from telethon.errors import UserNotParticipantError
 from telethon.tl.types import UpdateBotChatInviteRequester
 from telethon.tl.custom import Button
 import aiohttp
-
+#updated
 # ---- 1. Logging Setup ----
 # Get script directory for absolute logging path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
