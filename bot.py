@@ -281,8 +281,8 @@ async def start_bot(token: str, bot_id: str):
                     try:
                         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-                        # Check previous status + rejoin_count to detect REJOIN
-                        prev_res = await supabase.table('bot_join_users').select('status, rejoin_count').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
+                        # Check previous status + rejoin_count and left_channel flag to detect REJOIN
+                        prev_res = await supabase.table('bot_join_users').select('status, rejoin_count, left_channel').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
                         prev_data = getattr(prev_res, 'data', []) or []
 
                         update_data = {
@@ -294,7 +294,9 @@ async def start_bot(token: str, bot_id: str):
                             "is_bot_blocked": False,    # Clear blocked flag if they interact again
                         }
 
-                        if prev_data and prev_data[0].get('status') == 'leaved':
+                        # Even if status is "pending" (due to them sending a join request),
+                        # if left_channel was True, they are actually re-joining.
+                        if prev_data and (prev_data[0].get('status') == 'leaved' or prev_data[0].get('left_channel') is True):
                             # User was leaved and just came back — it's a REJOIN
                             update_data["rejoined_at"] = now_iso
                             update_data["rejoin_count"] = (prev_data[0].get('rejoin_count') or 0) + 1
