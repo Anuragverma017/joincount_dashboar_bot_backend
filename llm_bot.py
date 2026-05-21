@@ -197,7 +197,11 @@ async def bot_runner():
                 GLOBAL_BOT_CONFIGS[bot_id] = full_config
                 current_bot_ids.add(bot_id)
                 
-                if bot_id not in running_tasks:
+                if bot_id not in running_tasks or running_tasks[bot_id].done():
+                    if bot_id in running_tasks and running_tasks[bot_id].done():
+                        exc = running_tasks[bot_id].exception()
+                        if exc:
+                            logger.warning(f"LLM Bot {bot_id} task failed ({exc}), restarting...")
                     task = asyncio.create_task(start_bot(full_config))
                     running_tasks[bot_id] = task
                     
